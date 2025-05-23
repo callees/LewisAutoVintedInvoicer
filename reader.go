@@ -30,7 +30,7 @@ func (emailClient *EmailClient) start() {
 	}
 	log.Println("Connected")
 
-	if err := emailClient.c.Login("sales@dealorean.co.uk", "READ FROM ENV); err != nil {
+	if err := emailClient.c.Login("sales@dealorean.co.uk", "READ FROM ENV"); err != nil {
 		log.Fatal(err)
 	}
 	log.Println("Logged in")
