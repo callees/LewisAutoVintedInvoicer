@@ -8,6 +8,7 @@ require (
 	cloud.google.com/go/auth v0.16.1 // indirect
 	cloud.google.com/go/auth/oauth2adapt v0.2.8 // indirect
 	cloud.google.com/go/compute/metadata v0.6.0 // indirect
+	github.com/dslipak/pdf v0.0.2 // indirect
 	github.com/emersion/go-imap v1.2.1 // indirect
 	github.com/emersion/go-message v0.18.2 // indirect
 	github.com/emersion/go-sasl v0.0.0-20200509203442-7bfe0ed36a21 // indirect
