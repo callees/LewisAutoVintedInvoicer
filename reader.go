@@ -2,7 +2,9 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
+	"fmt"
 	"log"
 	"os"
 	"regexp"
@@ -11,75 +13,14 @@ import (
 
 	"github.com/dslipak/pdf"
 	"github.com/emersion/go-imap"
-	"github.com/emersion/go-imap/client"
+	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/mongo/options"
+	"go.mongodb.org/mongo-driver/mongo/readpref"
 )
 
 var vintedSalesEmail = "no-reply@vinted.co.uk"
 
 var testEmail = "payments-noreply@google.com"
-
-type EmailClient struct {
-	c *client.Client
-}
-
-func (emailClient *EmailClient) start() {
-	log.Println("Starting email reader...")
-
-	log.Println("Connecting to server...")
-
-	var err error
-	emailClient.c, err = client.DialTLS("imap.gmail.com:993", nil)
-	if err != nil {
-		log.Fatal(err)
-	}
-	log.Println("Connected")
-
-	if err := emailClient.c.Login("sales@dealorean.co.uk", "READ FROM ENV"); err != nil {
-		log.Fatal(err)
-	}
-	log.Println("Logged in")
-}
-
-func (emailClient EmailClient) logout() {
-	if err := emailClient.c.Logout(); err != nil {
-		log.Fatal(err)
-	}
-	log.Println("Logged out")
-}
-
-func (emailClient *EmailClient) checkForNewOrders() {
-	_, err := emailClient.c.Select("INBOX", false)
-	if err != nil {
-		log.Fatal(err)
-	}
-	criteria := imap.NewSearchCriteria()
-	criteria.WithoutFlags = []string{"\\Seen"}
-	uids, err := emailClient.c.Search(criteria)
-	if err != nil {
-		log.Println(err)
-	}
-
-	if len(uids) <= 0 {
-		log.Println("No new orders")
-		return
-	}
-
-	seqset := new(imap.SeqSet)
-	seqset.AddNum(uids...)
-	section := &imap.BodySectionName{}
-	items := []imap.FetchItem{imap.FetchEnvelope, imap.FetchFlags, imap.FetchInternalDate, section.FetchItem()}
-	messages := make(chan *imap.Message)
-	done := make(chan error, 1)
-	go func() {
-		done <- emailClient.c.Fetch(seqset, items, messages)
-	}()
-
-	for msg := range messages {
-		if /*isEmailFromVinted(msg) && */ isVintedEmailSubject(msg) {
-			go handleOrder(msg)
-		}
-	}
-}
 
 func isVintedEmailSubject(message *imap.Message) bool {
 	if strings.Contains(message.Envelope.Subject, "You’ve sold an item on Vinted") {
@@ -95,32 +36,65 @@ func isEmailFromVinted(message *imap.Message) bool {
 	return false
 }
 
-func handleOrder(message *imap.Message) {
-	log.Println("Processing Vinted order...")
+func saveOrderToDatabase(order Order) {
+	// Use the SetServerAPIOptions() method to set the version of the Stable API on the client
+	serverAPI := options.ServerAPI(options.ServerAPIVersion1)
+	opts := options.Client().ApplyURI("SECURE THIS").SetServerAPIOptions(serverAPI)
+	// Create a new client and connect to the server
+	var ctx context.Context
+	client, err := mongo.Connect(ctx, opts)
+	if err != nil {
+		panic(err)
+	}
+	defer func() {
+		if err = client.Disconnect(context.TODO()); err != nil {
+			panic(err)
+		}
+	}()
+	// Send a ping to confirm a successful connection
+	if err := client.Ping(context.TODO(), readpref.Primary()); err != nil {
+		panic(err)
+	}
+	fmt.Println("Pinged your deployment. You successfully connected to MongoDB!")
+	collection := client.Database("dealorean").Collection("customer-orders")
+	_, errz := collection.InsertOne(nil, order)
+	if errz != nil {
+		log.Println("Error saving order to database:", errz)
+		return //PANIC
+	}
+	log.Println("Order saved to database with ID:", order.OrderID)
+}
 
-	//create orderId
-
+func getBodyString(message *imap.Message) string {
 	section := &imap.BodySectionName{}
 	r := message.GetBody(section)
 	bodyBytes := make([]byte, r.Len())
 	_, err := r.Read(bodyBytes)
 	if err != nil {
 		log.Println("Error reading message body:", err)
-		return
+		return "" //PANIC
 	}
 
-	body := string(bodyBytes)
-	savePdf(body, 500)
+	return string(bodyBytes)
+}
 
-	log.Println("body: " + body)
-	log.Println("Buyer username: " + getBuyerUsername(body))
-	ah, _ := readPdf("what.pdf")
-	log.Println("PDF Content:", ah)
-	ahh := getPrice(ah, getBoughtItems(body)[0])
-	log.Println(ahh)
-	log.Println("Item(s) bought: " + strings.Join(getBoughtItems(body), ", "))
-	log.Println("Address: " + getAddress(body))
-	log.Println("Customer email: " + getCustomerEmail(body))
+func createOrderId(databaseId int64) int64 {
+	var orderId int64 = (93451*databaseId + 21444) % 99887
+	return orderId
+}
+
+func getMatchesBetweenTwoStrings(stringToSearch string, leftString string, rightString string) [][]string {
+	rx := regexp.MustCompile(`(?s)` + regexp.QuoteMeta(leftString) + `(.*?)` + regexp.QuoteMeta(rightString))
+	return rx.FindAllStringSubmatch(stringToSearch, -1)
+}
+
+func getDate(messageBody string) string {
+	matches := getMatchesBetweenTwoStrings(messageBody, "Received", "X-Received")
+
+	matches = getMatchesBetweenTwoStrings(matches[0][0], "\r\n", "\r\n")
+
+	date := strings.TrimSpace(matches[0][0])
+	return date
 }
 
 func readPdf(path string) (string, error) {
@@ -137,30 +111,43 @@ func readPdf(path string) (string, error) {
 	return buf.String(), nil
 }
 
-func savePdf(messageBody string, orderId int) {
-	xAttachRegexp, err := regexp.Compile("X-Attachment-Id: (.+?)\r\n")
+func getBase64PDFString(messageBody string) string {
+	xAttachRegexp, _ := regexp.Compile("X-Attachment-Id: (.+?)\r\n")
 	xAttachMatches := xAttachRegexp.FindAllStringSubmatch(messageBody, -1)
 	xAttachId := xAttachMatches[0][0]
 
-	left := xAttachId
-	right := `--`
-	rx := regexp.MustCompile(`(?s)` + regexp.QuoteMeta(left) + `(.*?)` + regexp.QuoteMeta(right))
-	matches := rx.FindAllStringSubmatch(messageBody, -1)
+	matches := getMatchesBetweenTwoStrings(messageBody, xAttachId, `--`)
 
 	base64PDF := strings.ReplaceAll(matches[0][1], xAttachId+"\r\n", "")
 	base64PDF = strings.ReplaceAll(base64PDF, "\r\n", "")
+
+	return base64PDF
+}
+
+func savePdf(messageBody string, orderIdString string) {
+	base64PDF := getBase64PDFString(messageBody)
 
 	pdfData, err := base64.StdEncoding.DecodeString(base64PDF)
 	if err != nil {
 		log.Fatalf("Failed to decode base64: %v", err)
 	}
 
-	f, _ := os.Create("what.pdf")
+	f, _ := os.Create(orderIdString + ".pdf")
 	defer f.Close()
 
 	if _, err := f.Write(pdfData); err != nil {
 		log.Fatalf("Failed to write PDF data to file: %v", err)
 	}
+}
+
+func getPdfFileString(messageBody string, orderId int64) string {
+	orderIdString := strconv.FormatInt(orderId, 10)
+
+	savePdf(messageBody, orderIdString)
+
+	pdfFile, _ := readPdf(orderIdString + ".pdf")
+	os.Remove(orderIdString + ".pdf")
+	return pdfFile
 }
 
 func getBuyerUsername(messageBody string) string {
@@ -175,39 +162,52 @@ func getBuyerUsername(messageBody string) string {
 	return username
 }
 
-func getMultipleItems(messageBody string) []string {
-	left := `has bought the following items:`
-	right := `We will transfer the buyer`
-	rx := regexp.MustCompile(`(?s)` + regexp.QuoteMeta(left) + `(.*?)` + regexp.QuoteMeta(right))
-	matches := rx.FindAllStringSubmatch(messageBody, -1)
+func getMultipleItemNames(messageBody string) []string {
+	matches := getMatchesBetweenTwoStrings(messageBody, `has bought the following items:`, `We will transfer the buyer`)
 
 	itemsString := strings.ReplaceAll(matches[0][1], "\r\n", "")
-	items := strings.Split(itemsString, "**")
+	return strings.Split(itemsString, "**")
+}
 
-	for itemIndex := range items {
-		items[itemIndex] = strings.ReplaceAll(items[itemIndex], "*", "")
+func getMultipleItems(messageBody string, pdfFile string) []Item {
+	itemNames := getMultipleItemNames(messageBody)
+
+	var items []Item
+	for itemIndex := range itemNames {
+		itemNames[itemIndex] = strings.ReplaceAll(itemNames[itemIndex], "*", "")
+		var item Item = Item{ItemName: itemNames[itemIndex], ItemPrice: getPrice(pdfFile, itemNames[itemIndex])}
+		items = append(items, item)
 	}
 	return items
 }
 
-func getBoughtItems(messageBody string) []string {
+func getItemName(messageBody string) string {
+	boughtItemRegexp, err := regexp.Compile("has bought(.+)")
+	if err != nil {
+		log.Println("Error compiling regex:", err)
+		//panic
+	}
+	matchedString := boughtItemRegexp.FindString(messageBody)
+
+	return strings.Replace(matchedString[:len(matchedString)-3], "has bought *", "", 1)
+}
+
+func getBoughtItems(messageBody string, pdfFile string) []Item {
+
 	multipleItemsRegexp, _ := regexp.Compile("has bought the following items:")
 
 	if multipleItemsRegexp.MatchString(messageBody) {
-		return getMultipleItems(messageBody)
+		return getMultipleItems(messageBody, pdfFile)
 	} else {
-		boughtItemRegexp, err := regexp.Compile("has bought(.+)")
-		if err != nil {
-			log.Println("Error compiling regex:", err)
-			return []string{""}
-		}
-		matchedString := boughtItemRegexp.FindString(messageBody)
+		var item Item
 
-		boughtItem := strings.Replace(matchedString[:len(matchedString)-3], "has bought *", "", 1)
+		item.ItemName = getItemName(messageBody)
+		item.ItemPrice = getPrice(pdfFile, item.ItemName)
 
-		return []string{boughtItem}
+		return []Item{item}
 	}
-	return []string{"meh"}
+	//panic
+	return []Item{}
 }
 
 func getPrice(pdfFile string, itemName string) float64 {
@@ -221,7 +221,47 @@ func getPrice(pdfFile string, itemName string) float64 {
 		return price
 	}
 
+	//panic
 	return 0.0
+}
+
+func getDeliveryPrice(pdfFile string) float64 {
+	deliveryRegexp := regexp.MustCompile("Shipping£[0-9]*.[0-9]*")
+	matched := deliveryRegexp.FindStringSubmatch(pdfFile)
+	deliveryPriceString := strings.ReplaceAll(matched[0], "Shipping£", "")
+	deliveryPrice, err := strconv.ParseFloat(deliveryPriceString, 64)
+
+	if err != nil {
+		panic("TODO PANIC")
+	}
+
+	return deliveryPrice
+}
+
+func getProtectionPrice(pdfFile string) float64 {
+	protectionRegexp := regexp.MustCompile("Buyer Protection Pro£[0-9]*.[0-9]*")
+	matched := protectionRegexp.FindStringSubmatch(pdfFile)
+	protectionPriceString := strings.ReplaceAll(matched[0], "Buyer Protection Pro£", "")
+	protectionPrice, err := strconv.ParseFloat(protectionPriceString, 64)
+
+	if err != nil {
+		panic("")
+	}
+
+	return protectionPrice
+}
+
+func getTotalPrice(pdfFile string) float64 {
+	totalPriceRegexp := regexp.MustCompile("Total:£[0-9]*.[0-9]*")
+	matched := totalPriceRegexp.FindStringSubmatch(pdfFile)
+	totalPriceString := strings.ReplaceAll(matched[0], "Total:£", "")
+	totalPrice, err := strconv.ParseFloat(totalPriceString, 64)
+
+	if err != nil {
+		panic("TODO PANIC")
+	}
+
+	return totalPrice
 }
 
 func getAddress(messageBody string) string {
@@ -237,6 +277,7 @@ func getAddress(messageBody string) string {
 		}
 		return address
 	}
+	//panic
 	return ""
 }
 
@@ -244,10 +285,7 @@ func getCustomerEmail(messageBody string) string {
 	addressRegexp := regexp.MustCompile(`>Email:</td>\s*([\s\S]+?)(?:\r?\n\r?\n|$)`)
 	matched := addressRegexp.FindStringSubmatch(messageBody)
 
-	left := `a href=3D"mailto:`
-	right := `" target`
-	rx := regexp.MustCompile(`(?s)` + regexp.QuoteMeta(left) + `(.*?)` + regexp.QuoteMeta(right))
-	matches := rx.FindAllStringSubmatch(matched[0], -1)
+	matches := getMatchesBetweenTwoStrings(matched[0], `a href=3D"mailto:`, `" target`)
 
 	email := strings.ReplaceAll(matches[0][1], "=\r\n", "")
 
